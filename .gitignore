@@ -1,0 +1,19 @@
+# AWS
+.aws/
+*.pem
+*.key
+
+# Environment variables
+.env
+.env.local
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Logs
+*.log

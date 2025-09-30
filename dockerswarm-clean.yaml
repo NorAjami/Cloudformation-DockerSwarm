@@ -1,0 +1,579 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'DockerSwarm-Stack - Complete Docker Swarm web application with Load Balancer'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: DockerSwarm
+    Description: Name used to tag all resources
+
+Resources:
+  # VPC - Our private network in the cloud
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-VPC'
+
+  # Internet Gateway - Gateway to the internet
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-IGW'
+
+  # Attach Internet Gateway to VPC
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # First subnet - in Availability Zone A
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: eu-west-1a
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-PublicSubnet-AZ1'
+
+  # Second subnet - in Availability Zone B (for redundancy)
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: eu-west-1b
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-PublicSubnet-AZ2'
+
+  # Route Table - Traffic rules for our network
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-PublicRouteTable'
+
+  # Rule: All traffic to internet goes via Internet Gateway
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Associate first subnet with route table
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  # Associate second subnet with route table
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  # Security Group for Load Balancer - allows only HTTP/HTTPS from internet
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-LoadBalancer-SG'
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP from anywhere
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS from anywhere
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-LoadBalancer-SG'
+
+  # Security Group for Docker Swarm nodes - only Load Balancer can talk to them
+  DockerSwarmSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-DockerSwarm-SG'
+      GroupDescription: Security group for Docker Swarm nodes
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # Python Flask app port (usually 5000)
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+          Description: Allow Flask app access from Load Balancer
+        # SSH for maintenance (from your IP only)
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0  # We will restrict this later
+          Description: Allow SSH for maintenance
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DockerSwarm-SG'
+
+  # Separate ingress rules for Docker Swarm internal communication
+  # (To avoid circular reference)
+  DockerSwarmInternalIngress1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DockerSwarmSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2376
+      ToPort: 2377
+      SourceSecurityGroupId: !Ref DockerSwarmSecurityGroup
+      Description: Docker Swarm management communication
+
+  DockerSwarmInternalIngress2:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DockerSwarmSecurityGroup
+      IpProtocol: tcp
+      FromPort: 7946
+      ToPort: 7946
+      SourceSecurityGroupId: !Ref DockerSwarmSecurityGroup
+      Description: Docker Swarm node communication TCP
+
+  DockerSwarmInternalIngress3:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DockerSwarmSecurityGroup
+      IpProtocol: udp
+      FromPort: 7946
+      ToPort: 7946
+      SourceSecurityGroupId: !Ref DockerSwarmSecurityGroup
+      Description: Docker Swarm node communication UDP
+
+  DockerSwarmInternalIngress4:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DockerSwarmSecurityGroup
+      IpProtocol: udp
+      FromPort: 4789
+      ToPort: 4789
+      SourceSecurityGroupId: !Ref DockerSwarmSecurityGroup
+      Description: Docker Swarm overlay network
+
+  # DynamoDB table to save form data
+  FormDataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-FormData'
+      BillingMode: PAY_PER_REQUEST  # Pay only for what you use
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S  # String
+        - AttributeName: timestamp
+          AttributeType: S  # String (ISO timestamp)
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH     # Partition key (primary key)
+        - AttributeName: timestamp  
+          KeyType: RANGE    # Sort key
+      GlobalSecondaryIndexes:
+        - IndexName: TimestampIndex
+          KeySchema:
+            - AttributeName: timestamp
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-FormData'
+        - Key: Environment
+          Value: Development
+
+  # IAM Role for EC2 instances to access DynamoDB
+  EC2DynamoDBRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-EC2-DynamoDB-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore  # For AWS Systems Manager
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: 
+                  - !GetAtt FormDataTable.Arn
+                  - !Sub '${FormDataTable.Arn}/index/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-EC2-DynamoDB-Role'
+
+  # Instance Profile to attach role to EC2
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2DynamoDBRole
+
+  # Application Load Balancer - distributes traffic to Docker Swarm nodes
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-ALB'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ALB'
+
+  # Target Group - defines which servers should receive traffic
+  DockerSwarmTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-DockerSwarm-TG'
+      Protocol: HTTP
+      Port: 5000  # Python Flask standard port
+      VpcId: !Ref VPC
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health  # We create this endpoint in Python app
+      HealthCheckPort: 5000
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-DockerSwarm-TG'
+
+  # Listener - listens on port 80 and sends to Target Group
+  LoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref DockerSwarmTargetGroup
+
+  # Launch Template - template for how EC2 instances should be created
+  DockerSwarmLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ProjectName}-LaunchTemplate'
+      LaunchTemplateData:
+        ImageId: ami-0c02fb55956c7d316  # Amazon Linux 2023 in eu-west-1
+        InstanceType: t3.micro  # Free tier compatible
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref DockerSwarmSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            
+            # Install Docker
+            yum install -y docker
+            systemctl start docker
+            systemctl enable docker
+            usermod -a -G docker ec2-user
+            
+            # Install Docker Compose
+            curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            chmod +x /usr/local/bin/docker-compose
+            
+            # Install Python and pip
+            yum install -y python3 python3-pip
+            
+            # Create our Python Flask app
+            mkdir -p /opt/webapp
+            cat > /opt/webapp/app.py << 'EOF'
+            from flask import Flask, request, jsonify, render_template_string
+            import boto3
+            import socket
+            import uuid
+            from datetime import datetime
+            import os
+            
+            app = Flask(__name__)
+            
+            # DynamoDB setup
+            dynamodb = boto3.resource('dynamodb', region_name='eu-west-1')
+            table = dynamodb.Table('${ProjectName}-FormData')
+            
+            # HTML template for our form
+            HTML_TEMPLATE = '''
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Docker Swarm Demo App</title>
+                <style>
+                    body { font-family: Arial; max-width: 600px; margin: 50px auto; padding: 20px; }
+                    .container { background: #f5f5f5; padding: 30px; border-radius: 10px; }
+                    .server-info { background: #e3f2fd; padding: 15px; margin: 20px 0; border-radius: 5px; }
+                    input, textarea { width: 100%; padding: 10px; margin: 10px 0; }
+                    button { background: #2196F3; color: white; padding: 15px 30px; border: none; border-radius: 5px; cursor: pointer; }
+                    button:hover { background: #1976D2; }
+                    .messages { margin-top: 30px; }
+                    .message { background: white; padding: 15px; margin: 10px 0; border-left: 4px solid #2196F3; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>Docker Swarm Load Balancer Demo</h1>
+                    
+                    <div class="server-info">
+                        <strong>Server Info:</strong><br>
+                        Hostname: {{ hostname }}<br>
+                        Container ID: {{ container_id[:12] }}<br>
+                        Timestamp: {{ timestamp }}
+                    </div>
+                    
+                    <h2>Send a message:</h2>
+                    <form method="POST" action="/submit">
+                        <input type="text" name="name" placeholder="Your name" required>
+                        <textarea name="message" placeholder="Your message" rows="4" required></textarea>
+                        <button type="submit">Send Message</button>
+                    </form>
+                    
+                    <div class="messages">
+                        <h3>Recent messages:</h3>
+                        {% for msg in messages %}
+                        <div class="message">
+                            <strong>{{ msg.name }}</strong> ({{ msg.timestamp }})<br>
+                            {{ msg.message }}<br>
+                            <small>Handled by: {{ msg.server }}</small>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+            </body>
+            </html>
+            '''
+            
+            @app.route('/')
+            def home():
+                hostname = socket.gethostname()
+                container_id = os.environ.get('HOSTNAME', hostname)
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                
+                # Get latest messages from DynamoDB
+                try:
+                    response = table.scan(Limit=5)
+                    messages = sorted(response['Items'], key=lambda x: x['timestamp'], reverse=True)
+                except Exception as e:
+                    messages = []
+                
+                return render_template_string(HTML_TEMPLATE, 
+                                            hostname=hostname,
+                                            container_id=container_id,
+                                            timestamp=timestamp,
+                                            messages=messages)
+            
+            @app.route('/submit', methods=['POST'])
+            def submit():
+                try:
+                    name = request.form['name']
+                    message = request.form['message']
+                    
+                    # Save to DynamoDB
+                    item = {
+                        'id': str(uuid.uuid4()),
+                        'timestamp': datetime.now().isoformat(),
+                        'name': name,
+                        'message': message,
+                        'server': socket.gethostname()
+                    }
+                    
+                    table.put_item(Item=item)
+                    return jsonify({'success': True, 'message': 'Message saved!'})
+                    
+                except Exception as e:
+                    return jsonify({'success': False, 'error': str(e)}), 500
+            
+            @app.route('/health')
+            def health():
+                return jsonify({
+                    'status': 'healthy',
+                    'server': socket.gethostname(),
+                    'timestamp': datetime.now().isoformat()
+                })
+            
+            if __name__ == '__main__':
+                app.run(host='0.0.0.0', port=5000, debug=True)
+            EOF
+            
+            # Install Flask and boto3
+            pip3 install flask boto3
+            
+            # Create systemd service for our app
+            cat > /etc/systemd/system/webapp.service << EOF
+            [Unit]
+            Description=Flask Web Application
+            After=network.target
+            
+            [Service]
+            Type=simple
+            User=ec2-user
+            WorkingDirectory=/opt/webapp
+            ExecStart=/usr/bin/python3 /opt/webapp/app.py
+            Restart=always
+            
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            
+            # Start our app
+            systemctl daemon-reload
+            systemctl enable webapp
+            systemctl start webapp
+            
+            # Set up Docker Swarm (this instance becomes manager)
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+            
+            # Initialize Docker Swarm if we are first instance
+            docker swarm init --advertise-addr $PRIVATE_IP 2>/dev/null || echo "Swarm already initialized or joining existing"
+        
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${ProjectName}-DockerSwarm-Node'
+
+  # Auto Scaling Group - manages number of instances automatically
+  DockerSwarmAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${ProjectName}-ASG'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref DockerSwarmLaunchTemplate
+        Version: !GetAtt DockerSwarmLaunchTemplate.LatestVersionNumber
+      MinSize: 2
+      MaxSize: 4
+      DesiredCapacity: 2
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      TargetGroupARNs:
+        - !Ref DockerSwarmTargetGroup
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ASG'
+          PropagateAtLaunch: false
+
+Outputs:
+  VPCId:
+    Description: ID of our VPC
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${ProjectName}-VPC-ID'
+  
+  PublicSubnet1Id:
+    Description: ID of first public subnet
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${ProjectName}-PublicSubnet1-ID'
+      
+  PublicSubnet2Id:
+    Description: ID of second public subnet
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${ProjectName}-PublicSubnet2-ID'
+
+  LoadBalancerSecurityGroupId:
+    Description: Security Group for Load Balancer
+    Value: !Ref LoadBalancerSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-LoadBalancer-SG-ID'
+
+  DockerSwarmSecurityGroupId:
+    Description: Security Group for Docker Swarm nodes
+    Value: !Ref DockerSwarmSecurityGroup
+    Export:
+      Name: !Sub '${ProjectName}-DockerSwarm-SG-ID'
+
+  DynamoDBTableName:
+    Description: Name of DynamoDB table
+    Value: !Ref FormDataTable
+    Export:
+      Name: !Sub '${ProjectName}-DynamoDB-Table-Name'
+
+  DynamoDBTableArn:
+    Description: ARN of DynamoDB table
+    Value: !GetAtt FormDataTable.Arn
+    Export:
+      Name: !Sub '${ProjectName}-DynamoDB-Table-ARN'
+
+  EC2InstanceProfileArn:
+    Description: Instance Profile for EC2 instances
+    Value: !GetAtt EC2InstanceProfile.Arn
+    Export:
+      Name: !Sub '${ProjectName}-EC2-InstanceProfile-ARN'
+
+  LoadBalancerDNSName:
+    Description: DNS name of Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${ProjectName}-LoadBalancer-DNS'
+
+  LoadBalancerURL:
+    Description: URL to our web application
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+    
+  TargetGroupArn:
+    Description: Target Group ARN for EC2 instances
+    Value: !Ref DockerSwarmTargetGroup
+    Export:
+      Name: !Sub '${ProjectName}-TargetGroup-ARN'
